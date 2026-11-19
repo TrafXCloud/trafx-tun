@@ -1,5 +1,6 @@
-# prebuilt phantun binaries: scripts/fetch-phantun.sh downloads them (bin/SHA256SUMS is kept)
+# phantun binaries: scripts/build-phantun.sh builds them from phantun/
 bin/*/
 # build output
 dist/
 *.tar
+phantun/target/

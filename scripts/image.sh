@@ -8,7 +8,7 @@
 #   -> dist/trafx-phantun-<arch>.tar
 set -euo pipefail
 cd "$(dirname "$0")/.."
-version="${1:-0.1.0}"
+version="${1:-0.4.0}"
 arch="${2:-amd64}"
 case "$arch" in
   amd64|arm64) platform="linux/$arch" ;;
@@ -18,12 +18,11 @@ esac
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 tag="trafx-phantun:${version}-${arch}"
-docker build -q --platform "$platform" \
+[ -n "${NO_BUILD:-}" ] || docker build -q --platform "$platform" \
   --build-arg BASE_IMAGE="${BASE_IMAGE:-docker.arvancloud.ir/library/alpine:3.20}" \
-  --build-arg GO_IMAGE="${GO_IMAGE:-docker.arvancloud.ir/library/golang:1.24}" \
   ${ALPINE_MIRROR:+--build-arg ALPINE_MIRROR="$ALPINE_MIRROR"} \
   -t "$tag" . >/dev/null
-out="dist/trafx-phantun-${arch}.tar"
+out="dist/trafx-phantun-${OUT_VERSION:+$OUT_VERSION-}${arch}.tar"
 docker save "$tag" -o "$work/saved.tar"
 python3 -I - "$work/saved.tar" "$out" <<'EOF'
 import gzip, hashlib, io, json, sys, tarfile

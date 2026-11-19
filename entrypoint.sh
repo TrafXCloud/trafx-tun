@@ -14,12 +14,13 @@
 #   PHANTUN_TUN_LOCAL / PHANTUN_TUN_PEER  tun addresses    [client 192.168.200.1/.2, server 192.168.201.1/.2]
 #   PHANTUN_OUT_IF    outward interface                    [interface of the default route]
 #   PHANTUN_HANDSHAKE_PACKET  file sent as first packet after the handshake
-#   PHANTUN_CONNECTIONS  client: fake-TCP connections; >1 puts udpmux in front [1]
-#                        (the server always merges with udpmux, any number works)
-#   PHANTUN_BUFFER    udpmux socket buffer bytes           [4194304]
+#   PHANTUN_CONNECTIONS  client: fake-TCP connections per WireGuard flow [1]
+#                        (the server groups them by itself, nothing to set there)
+#   PHANTUN_RATE      pace outgoing fake TCP (done by phantun), e.g. 200mbit [off]
+#   PHANTUN_PEER_TIMEOUT  close a flow after this many seconds without a packet
+#                        from the other side [60]
 #   RUST_LOG          [info]
 set -eu
-MUX_PORT=127.0.0.1:51900
 
 log() { echo "trafx-phantun: $*"; }
 die() { log "ERROR: $*"; exit 2; }
@@ -37,27 +38,13 @@ case "$MODE" in
     TUN_LOCAL="${PHANTUN_TUN_LOCAL:-192.168.200.1}"; TUN_PEER="${PHANTUN_TUN_PEER:-192.168.200.2}"
     CONNS="${PHANTUN_CONNECTIONS:-1}"
     case "$CONNS" in ''|*[!0-9]*) die "PHANTUN_CONNECTIONS must be a number" ;; esac
-    [ "$CONNS" -ge 1 ] && [ "$CONNS" -le 256 ] || die "PHANTUN_CONNECTIONS must be 1..256"
-    MUX=
-    if [ "$CONNS" -gt 1 ]; then
-      MUX="/usr/local/bin/udpmux -mode client -listen $LISTEN -upstream $MUX_PORT -n $CONNS -buffer ${PHANTUN_BUFFER:-4194304}"
-      LISTEN="$MUX_PORT"
-    fi
-    set -- /usr/local/bin/phantun_client --local "$LISTEN" --remote "$REMOTE" -4 ;;
+    [ "$CONNS" -ge 1 ] && [ "$CONNS" -le 64 ] || die "PHANTUN_CONNECTIONS must be 1..64"
+    set -- /usr/local/bin/phantun_client --local "$LISTEN" --remote "$REMOTE" --connections "$CONNS" -4 ;;
   server)
     PORT="${PHANTUN_PORT:-4567}"
     FORWARD="${PHANTUN_FORWARD:-}"; [ -n "$FORWARD" ] || die "PHANTUN_FORWARD is required (WireGuard ip:port)"
     TUN_LOCAL="${PHANTUN_TUN_LOCAL:-192.168.201.1}"; TUN_PEER="${PHANTUN_TUN_PEER:-192.168.201.2}"
-    # udpmux merges the client's N connections into one WireGuard endpoint.
-    # PHANTUN_CONNECTIONS=1 on the server skips it (no extra hop) when every
-    # client uses a single connection.
-    if [ "${PHANTUN_CONNECTIONS:-}" = 1 ]; then
-      MUX=
-      set -- /usr/local/bin/phantun_server --local "$PORT" --remote "$FORWARD" -4
-    else
-      MUX="/usr/local/bin/udpmux -mode server -listen $MUX_PORT -upstream $FORWARD -buffer ${PHANTUN_BUFFER:-4194304}"
-      set -- /usr/local/bin/phantun_server --local "$PORT" --remote "$MUX_PORT" -4
-    fi ;;
+    set -- /usr/local/bin/phantun_server --local "$PORT" --remote "$FORWARD" -4 ;;
   *) die "PHANTUN_MODE must be client or server" ;;
 esac
 set -- "$@" --tun "$TUN" --tun-local "$TUN_LOCAL" --tun-peer "$TUN_PEER"
@@ -68,6 +55,12 @@ set -- "$@" --tun "$TUN" --tun-local "$TUN_LOCAL" --tun-peer "$TUN_PEER"
 
 { echo 1 > /proc/sys/net/ipv4/ip_forward; } 2>/dev/null || true
 [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = 1 ] || log "WARNING: ip_forward is off (on a Linux host: sysctl -w net.ipv4.ip_forward=1)"
+
+# phantun asks for 4 MB UDP buffers. Where SO_RCVBUFFORCE is refused
+# (RouterOS containers), the kernel caps them at net.core.rmem_max; raise it
+# when this namespace allows that.
+{ echo 8388608 > /proc/sys/net/core/rmem_max; } 2>/dev/null || true
+log "net.core.rmem_max: $(cat /proc/sys/net/core/rmem_max 2>/dev/null || echo ?)"
 
 # Phantun's fake TCP does not negotiate window scaling, so strict conntrack
 # window tracking (which the NAT rule below needs) marks most in-flight packets
@@ -99,28 +92,40 @@ fi
 log "mode=$MODE out_if=$OUT_IF tun=$TUN $TUN_LOCAL<->$TUN_PEER ($IPT)"
 
 PID=
-MPID=
 stop() {
-  for p in $PID $MPID; do kill "$p" 2>/dev/null; done
-  for p in $PID $MPID; do wait "$p" 2>/dev/null; done
+  [ -n "$PID" ] && kill "$PID" 2>/dev/null && wait "$PID" 2>/dev/null
   nat_clean; exit 0
 }
 trap stop TERM INT
-if [ -n "$MUX" ]; then
-  log "exec: $MUX"
-  $MUX &
-  MPID=$!
-fi
 log "exec: $*"
 "$@" &
 PID=$!
 set +e
-# Exit (and let the restart policy restart us) when either process dies.
-while kill -0 "$PID" 2>/dev/null && { [ -z "$MPID" ] || kill -0 "$MPID" 2>/dev/null; }; do
-  sleep 2
+# phantun creates the tun device; the default queue (500 packets) overflows
+# in WireGuard bursts and drops packets before phantun reads them.
+QLEN="${PHANTUN_TXQUEUELEN:-10000}"
+for _ in $(seq 1 50); do
+  [ -e "/sys/class/net/$TUN" ] && { ip link set "$TUN" txqueuelen "$QLEN" 2>/dev/null || ip link set "$TUN" qlen "$QLEN"; } && break
+  sleep 0.1
 done
-for p in $PID $MPID; do kill "$p" 2>/dev/null; done
-wait "$PID" 2>/dev/null
+log "tun $TUN txqueuelen $(cat /sys/class/net/$TUN/tx_queue_len 2>/dev/null || echo ?)"
+
+# Every 60 s, log drops inside the container when they grew: packets the
+# kernel could not queue to phantun (tun tx_dropped) and UDP receive buffer
+# overflows. Loss here is ours, not the network's.
+(
+  last=
+  while kill -0 "$PID" 2>/dev/null; do
+    sleep 60
+    tund=$(cat "/sys/class/net/$TUN/statistics/tx_dropped" 2>/dev/null || echo 0)
+    udpd=$(awk '/^Udp:/{n++; if(n==1){for(i=1;i<=NF;i++) h[i]=$i} else {for(i=1;i<=NF;i++) if(h[i]=="RcvbufErrors") print $i}}' /proc/net/snmp 2>/dev/null)
+    cur="tun_dropped=$tund udp_rcvbuf_errors=${udpd:-?}"
+    [ "$cur" != "$last" ] && log "drops in container (total): $cur"
+    last=$cur
+  done
+) &
+wait "$PID"
+RC=$?
 nat_clean
-log "phantun or udpmux exited"
+log "phantun exited ($RC)"
 exit 1
